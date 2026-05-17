@@ -5,6 +5,8 @@ import glob
 import json
 import os
 
+RESULTS_DIR = "results"
+
 CSV_COLUMNS = [
     "timestamp",
     "candidate_name",
@@ -46,14 +48,13 @@ def _flatten(record: dict) -> dict:
 def export_csv(
     from_date: datetime.date = None,
     to_date: datetime.date = None,
-    output_path: str = "screening_results/all_results.csv",
+    output_path: str = None,
 ) -> tuple[int, str]:
-    """
-    Read all JSONs from screening_results/, filter by date range, write a CSV.
-    Returns (row_count, output_path).
-    """
+    if output_path is None:
+        output_path = os.path.join(RESULTS_DIR, "all_results.csv")
+
     records = []
-    for filepath in sorted(glob.glob("screening_results/*.json")):
+    for filepath in sorted(glob.glob(os.path.join(RESULTS_DIR, "*.json"))):
         try:
             with open(filepath) as f:
                 data = json.load(f)
@@ -81,7 +82,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Export screening results to CSV.")
     parser.add_argument("--from", dest="from_date", help="Start date (YYYY-MM-DD), inclusive")
     parser.add_argument("--to", dest="to_date", help="End date (YYYY-MM-DD), inclusive")
-    parser.add_argument("--out", default=None, help="Output CSV path (default: auto-named in screening_results/)")
+    parser.add_argument("--out", default=None, help="Output CSV path")
     args = parser.parse_args()
 
     from_date = datetime.date.fromisoformat(args.from_date) if args.from_date else None
@@ -91,9 +92,9 @@ if __name__ == "__main__":
         output_path = args.out
     elif from_date or to_date:
         label = f"{args.from_date or 'start'}_to_{args.to_date or 'today'}"
-        output_path = f"screening_results/export_{label}.csv"
+        output_path = os.path.join(RESULTS_DIR, f"export_{label}.csv")
     else:
-        output_path = "screening_results/all_results.csv"
+        output_path = os.path.join(RESULTS_DIR, "all_results.csv")
 
     count, path = export_csv(from_date, to_date, output_path)
     print(f"Exported {count} record(s) → {path}")

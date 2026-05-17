@@ -6,16 +6,12 @@ from dotenv import load_dotenv
 
 from livekit import agents, api
 from livekit.agents import AgentSession, Agent, RoomInputOptions
-from livekit.plugins import (
-    openai,
-    cartesia,
-    deepgram,
-    noise_cancellation,
-    silero,
-)
+from livekit.plugins import openai, cartesia, deepgram, noise_cancellation, silero
 from livekit.agents import llm
 from typing import Annotated
-from export import export_csv
+
+from screener.criteria import ROLE_CRITERIA, DEFAULT_CRITERIA, classify
+from screener.export import export_csv, RESULTS_DIR
 
 load_dotenv(".env")
 
@@ -23,28 +19,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("candidate-screener")
 
 OUTBOUND_TRUNK_ID = os.getenv("OUTBOUND_TRUNK_ID")
-
-ROLE_CRITERIA = {
-    "Backend Engineer": {
-        "required_skills": ["Python", "FastAPI", "Django", "Go", "Node.js"],
-        "max_notice_period_days": 60,
-        "ctc_range_lpa": (10, 25),
-        "open_to_remote": True,
-    },
-    "Frontend Engineer": {
-        "required_skills": ["React", "Vue", "TypeScript"],
-        "max_notice_period_days": 45,
-        "ctc_range_lpa": (8, 20),
-        "open_to_remote": True,
-    },
-}
-
-DEFAULT_CRITERIA = {
-    "required_skills": [],
-    "max_notice_period_days": 90,
-    "ctc_range_lpa": (0, 999),
-    "open_to_remote": True,
-}
 
 
 def _build_tts():
@@ -60,31 +34,6 @@ def _build_tts():
     model = os.getenv("OPENAI_TTS_MODEL", "tts-1")
     voice = os.getenv("OPENAI_TTS_VOICE", "alloy")
     return openai.TTS(model=model, voice=voice)
-
-
-def _classify(skills: list[str], notice_period_days: int, expected_ctc_lpa: float, criteria: dict) -> tuple[str, str]:
-    required_skills = criteria["required_skills"]
-    max_notice = criteria["max_notice_period_days"]
-    ctc_min, ctc_max = criteria["ctc_range_lpa"]
-
-    skill_match = not required_skills or any(s.strip().lower() in [c.lower() for c in skills] for s in required_skills)
-    notice_ok = notice_period_days <= max_notice
-    ctc_ok = ctc_min <= expected_ctc_lpa <= ctc_max
-
-    reasons = []
-    if required_skills:
-        matched = [s for s in required_skills if s.lower() in [c.lower() for c in skills]]
-        reasons.append(f"Skill match: {', '.join(matched) if matched else 'none'}.")
-    reasons.append(f"Notice {notice_period_days}d {'≤' if notice_ok else '>'} {max_notice}d limit.")
-    reasons.append(f"Expected CTC {expected_ctc_lpa} LPA {'within' if ctc_ok else 'outside'} range {ctc_min}-{ctc_max}.")
-    reason_str = " ".join(reasons)
-
-    if skill_match and notice_ok and ctc_ok:
-        return "qualified", reason_str
-    elif skill_match and (notice_ok or ctc_ok):
-        return "maybe", reason_str
-    else:
-        return "rejected", reason_str
 
 
 class ScreeningTools(llm.ToolContext):
@@ -112,13 +61,14 @@ class ScreeningTools(llm.ToolContext):
         call_outcome: Annotated[str, "One of: completed, not_available, declined, voicemail"],
     ) -> str:
         skills_list = [s.strip() for s in skills.split(",") if s.strip()]
-        classification, reason = _classify(skills_list, notice_period_days, expected_ctc_lpa, self.criteria)
+        classification, reason = classify(skills_list, notice_period_days, expected_ctc_lpa, self.criteria)
 
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+        now = datetime.datetime.now()
+        timestamp = now.strftime("%Y-%m-%dT%H-%M-%S")
         safe_phone = self.phone_number.replace("+", "").replace(" ", "")
 
         result = {
-            "timestamp": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "timestamp": now.strftime("%Y-%m-%dT%H:%M:%S"),
             "phone_number": self.phone_number,
             "candidate_name": self.candidate_name,
             "role": self.role,
@@ -141,18 +91,17 @@ class ScreeningTools(llm.ToolContext):
             },
         }
 
-        os.makedirs("screening_results", exist_ok=True)
-        filepath = f"screening_results/{timestamp}_{safe_phone}.json"
+        os.makedirs(RESULTS_DIR, exist_ok=True)
+        filepath = os.path.join(RESULTS_DIR, f"{timestamp}_{safe_phone}.json")
         with open(filepath, "w") as f:
             json.dump(result, f, indent=2)
 
-        logger.info(f"Screening result saved: {filepath} | classification={classification}")
+        logger.info(f"Result saved: {filepath} | classification={classification}")
 
-        count, csv_path = export_csv(output_path="screening_results/all_results.csv")
+        count, csv_path = export_csv()
         logger.info(f"CSV updated: {csv_path} ({count} total records)")
 
         return f"Result saved to {filepath}."
-
 
 
 class CandidateScreenerAgent(Agent):
@@ -188,8 +137,8 @@ Ask these one at a time in a natural, conversational tone. Do not rush.
 Allow natural follow-ups. If the candidate asks about the company or role, answer briefly and redirect back to screening.
 
 --- HANDLING EDGE CASES ---
-- If asked "Are you a bot / AI?": be honest — "Yes, I'm an AI assistant. I'm conducting the initial screening on behalf of the recruiting team. Would you like to continue, or would you prefer to speak with a human recruiter?"
-- If candidate wants to speak to a human: apologize and let them know the recruiting team will follow up directly.
+- If asked "Are you a bot / AI?": be honest — "Yes, I'm an AI assistant conducting the initial screening on behalf of the recruiting team. Would you like to continue?"
+- If candidate wants to speak to a human: let them know the recruiting team will follow up directly.
 - If the candidate is hostile or asks to stop: apologize and end the call, log as "declined".
 - If there is long silence or you suspect voicemail: leave a brief message — "Hi {candidate_name}, this is Aria calling about a {role} opportunity. Please call us back at your convenience. Thank you!" — then log as "voicemail".
 
@@ -253,7 +202,7 @@ async def entrypoint(ctx: agents.JobContext):
             )
             logger.info("Call answered. Starting screening.")
             await session.generate_reply(
-                instructions=f"The candidate has answered. Begin the opening sequence immediately."
+                instructions="The candidate has answered. Begin the opening sequence immediately."
             )
         except Exception as e:
             logger.error(f"Failed to place outbound call: {e}")

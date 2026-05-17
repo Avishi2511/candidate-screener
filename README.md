@@ -1,15 +1,16 @@
 # AI Candidate Phone Screener
 
-An AI-powered outbound phone screening agent built on LiveKit. It calls candidates, conducts a structured 5-question screening conversation, and saves a classified result (qualified / maybe / rejected) to a JSON file — no human recruiter needed for the first pass.
+An AI-powered outbound phone screening agent built on LiveKit. It calls candidates, conducts a structured screening conversation, and saves a classified result (qualified / maybe / rejected) as JSON and CSV — no human recruiter needed for the first pass.
 
 ---
 
 ## How It Works
 
-1. You dispatch a call via `make_call.py` with the candidate's name, phone number, and role.
-2. The LiveKit agent (`agent.py`) picks up the job, dials the candidate over SIP, and speaks first.
-3. The agent (named Aria) conducts a natural screening conversation — current role, skills, notice period, current CTC, expected CTC, relocation preference.
-4. After the goodbye, the agent silently calls `submit_screening_result`, which classifies the candidate and writes a JSON file to `screening_results/`.
+1. Dispatch a call via `make_call.py` with the candidate's name, phone number, and role.
+2. The agent picks up the job, dials the candidate over SIP, and speaks first.
+3. Aria (the AI recruiter) conducts a natural 5-question screening conversation.
+4. After the goodbye, the agent silently classifies the candidate and saves the result to `results/`.
+5. `results/all_results.csv` is automatically updated after every call.
 
 ---
 
@@ -30,12 +31,17 @@ An AI-powered outbound phone screening agent built on LiveKit. It calls candidat
 
 ```
 candidate-screener/
-├── agent.py              # Agent logic — screener, tools, criteria, entrypoint
-├── make_call.py          # CLI to dispatch a screening call
-├── setup_trunk.py        # One-time SIP trunk configuration
-├── requirements.txt      # Python dependencies
-├── .env.example          # Environment variable template
-└── screening_results/    # Auto-created; one JSON file per completed call
+├── screener/
+│   ├── __init__.py
+│   ├── criteria.py       # Role configs (ROLE_CRITERIA) and classify()
+│   └── export.py         # export_csv() logic + CLI
+├── results/              # Auto-created. One JSON per call + all_results.csv
+├── agent.py              # Agent entry point  →  python agent.py dev
+├── make_call.py          # Dispatch a call   →  python make_call.py ...
+├── setup_trunk.py        # One-time SIP setup →  python setup_trunk.py
+├── requirements.txt
+├── .env.example
+└── .gitignore
 ```
 
 ---
@@ -77,7 +83,6 @@ Open `.env` and fill in:
 | `VOBIZ_PASSWORD` | Vobiz Console |
 | `VOBIZ_OUTBOUND_NUMBER` | Your DID from Vobiz (e.g. `+91XXXXXXXXXX`) |
 | `OUTBOUND_TRUNK_ID` | Auto-set by `setup_trunk.py` (see next step) |
-| `DEFAULT_TRANSFER_NUMBER` | Number to transfer to if candidate requests a human |
 
 ### 4. Register the SIP trunk (one-time)
 
@@ -85,9 +90,7 @@ Open `.env` and fill in:
 python setup_trunk.py
 ```
 
-This creates or updates the LiveKit SIP trunk with your Vobiz credentials and prints the `OUTBOUND_TRUNK_ID`. Copy it into your `.env`.
-
-To verify the trunk exists:
+Copy the printed `OUTBOUND_TRUNK_ID` into your `.env`. To verify anytime:
 
 ```powershell
 python setup_trunk.py --list
@@ -97,34 +100,32 @@ python setup_trunk.py --list
 
 ## Running a Screening Call
 
-### Terminal 1 — Start the agent
+**Terminal 1 — start the agent:**
 
 ```powershell
 python agent.py dev
 ```
 
-The agent connects to LiveKit and waits for a dispatch job. Leave this running.
-
-### Terminal 2 — Dispatch a call
+**Terminal 2 — dispatch a call:**
 
 ```powershell
 python make_call.py --to +91XXXXXXXXXX --name "Rahul Sharma" --role "Backend Engineer"
 ```
 
-The agent dials the candidate, conducts the screening, and saves the result automatically.
+The agent dials the candidate, conducts the screening, and writes the result to `results/` automatically.
 
 ---
 
 ## Screening Criteria
 
-Criteria are defined in `ROLE_CRITERIA` at the top of `agent.py`. Currently configured:
+Defined in `screener/criteria.py`. Currently configured:
 
 | Role | Required Skills (any one) | Max Notice | CTC Range |
 |---|---|---|---|
 | Backend Engineer | Python, FastAPI, Django, Go, Node.js | 60 days | 10–25 LPA |
 | Frontend Engineer | React, Vue, TypeScript | 45 days | 8–20 LPA |
 
-To add a new role, add an entry to `ROLE_CRITERIA` in `agent.py`:
+To add a new role, add an entry to `ROLE_CRITERIA` in `screener/criteria.py`:
 
 ```python
 "Data Engineer": {
@@ -137,15 +138,20 @@ To add a new role, add an entry to `ROLE_CRITERIA` in `agent.py`:
 
 ---
 
-## Output
+## Results
 
-Each call produces a file at `screening_results/{timestamp}_{phone}.json`:
+Every completed call writes two things to `results/`:
+
+- `{timestamp}_{phone}.json` — full structured record for that candidate
+- `all_results.csv` — auto-regenerated after every call, contains all records
+
+**Sample JSON:**
 
 ```json
 {
-  "timestamp": "2026-05-16T14:32:00",
-  "phone_number": "+91XXXXXXXXXX",
+  "timestamp": "2026-05-18T14:32:00",
   "candidate_name": "Rahul Sharma",
+  "phone_number": "+91XXXXXXXXXX",
   "role": "Backend Engineer",
   "call_outcome": "completed",
   "answers": {
@@ -173,21 +179,37 @@ Each call produces a file at `screening_results/{timestamp}_{phone}.json`:
 |---|---|
 | `qualified` | Skill match + notice OK + CTC in range |
 | `maybe` | Skill match + either notice OK or CTC in range |
-| `rejected` | Skill mismatch or both notice and CTC out of range |
+| `rejected` | No skill match, or both notice and CTC out of range |
 
 **Call outcomes:** `completed`, `not_available`, `declined`, `voicemail`
 
 ---
 
-## Call Transfer
+## Exporting to CSV
 
-If the candidate says "I'd rather speak to a human", the agent transfers the call to `DEFAULT_TRANSFER_NUMBER` via SIP REFER. See `transfer_call.md` for detailed troubleshooting.
+`results/all_results.csv` is kept up to date automatically. For a filtered export between two dates:
+
+```powershell
+# All records
+python -m screener.export
+
+# From a specific date onwards
+python -m screener.export --from 2026-05-18
+
+# Between two dates
+python -m screener.export --from 2026-05-01 --to 2026-05-18
+
+# Custom output path
+python -m screener.export --from 2026-05-01 --to 2026-05-18 --out reports/may_batch.csv
+```
+
+Filtered exports are saved as `results/export_{from}_to_{to}.csv` so they don't overwrite `all_results.csv`.
 
 ---
 
 ## TTS Provider
 
-The agent defaults to OpenAI TTS. To switch to Cartesia, set in `.env`:
+Defaults to OpenAI TTS. To switch to Cartesia, set in `.env`:
 
 ```env
 TTS_PROVIDER=cartesia
